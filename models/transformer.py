@@ -21,6 +21,7 @@ from models.utils import LayerNorm2D
 
 from models.global_ape_decoder import build_global_ape_decoder
 from models.global_rpe_decomp_decoder import build_global_rpe_decomp_decoder
+from models.global_rpb_decoder import build_global_rpb_decoder
 
 
 class Transformer(nn.Module):
@@ -52,6 +53,8 @@ class Transformer(nn.Module):
             self.decoder = build_global_ape_decoder(args)
         elif decoder_type == 'global_rpe_decomp':
             self.decoder = build_global_rpe_decomp_decoder(args)
+        elif decoder_type == 'global_rpb':
+            self.decoder = build_global_rpb_decoder(args)
         else:
             raise NotImplementedError
 

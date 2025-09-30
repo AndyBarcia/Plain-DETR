@@ -43,36 +43,22 @@ class GlobalCrossAttention(nn.Module):
         self.feature_stride = feature_stride
         self.reparam = reparam
 
-        self.is_standard = rpe_type not in ['pos_mlp', 'pos_gaussian']
-        self.cross_attn = None
-
-        if self.is_standard:
-            self.cpb_mlp1 = self.build_cpb_mlp(2, rpe_hidden_dim, num_heads)
-            self.cpb_mlp2 = self.build_cpb_mlp(2, rpe_hidden_dim, num_heads)
-            self.q = nn.Linear(dim, dim, bias=qkv_bias)
-            self.k = nn.Linear(dim, dim, bias=qkv_bias)
-            self.v = nn.Linear(dim, dim, bias=qkv_bias)
-            self.attn_drop = nn.Dropout(attn_drop)
-            self.proj = nn.Linear(dim, dim)
-            self.proj_drop = nn.Dropout(proj_drop)
-            self.softmax = nn.Softmax(dim=-1)
-        else:
-            if rpe_type == 'pos_mlp':
-                self.cross_attn = PosMLPAttention(
-                    dim=dim,
-                    num_heads=num_heads,
-                    hidden_dim=rpe_hidden_dim,
-                    dropout=attn_drop,
-                    implementation='cuda'
-                )
-            elif rpe_type == 'pos_gaussian':
-                self.cross_attn = PosGaussianAttention(
-                    dim=dim,
-                    num_heads=num_heads,
-                    k_dim=dim,
-                    dropout=attn_drop,
-                    implementation='cuda'
-                )
+        if rpe_type == 'pos_mlp':
+            self.cross_attn = PosMLPAttention(
+                dim=dim,
+                num_heads=num_heads,
+                hidden_dim=rpe_hidden_dim,
+                dropout=attn_drop,
+                implementation='cuda'
+            )
+        elif rpe_type == 'pos_gaussian':
+            self.cross_attn = PosGaussianAttention(
+                dim=dim,
+                num_heads=num_heads,
+                k_dim=dim,
+                dropout=attn_drop,
+                implementation='cuda'
+            )
 
     def build_cpb_mlp(self, in_dim, hidden_dim, out_dim):
         cpb_mlp = nn.Sequential(nn.Linear(in_dim, hidden_dim, bias=True),
@@ -102,103 +88,39 @@ class GlobalCrossAttention(nn.Module):
         if reference_points.dim() == 4:
             reference_points = reference_points.squeeze(2)
 
-        if self.is_standard:
-            # Standard RPE computation
-            # Add positional embeddings
-            if query_pos.dim() == 2:
-                query = raw_query + query_pos[None, :, :]
-            else:
-                query = raw_query + query_pos
-
-            if src_pos_embed.dim() == 2:
-                k_input_flatten = raw_src + src_pos_embed[None, :, :]
-            else:
-                k_input_flatten = raw_src + src_pos_embed
-
-            v_input_flatten = raw_src
-
-            stride = self.feature_stride
-
-            ref_pts = torch.cat([
-                reference_points[:, :, :2] - reference_points[:, :, 2:] / 2,
-                reference_points[:, :, :2] + reference_points[:, :, 2:] / 2,
-            ], dim=-1)  # B, nQ, 4
-            if not self.reparam:
-                ref_pts[..., 0::2] *= (w * stride)
-                ref_pts[..., 1::2] *= (h * stride)
-            pos_x = torch.linspace(0.5, w - 0.5, w, dtype=torch.float32, device=w.device)[None, None, :, None] * stride  # 1, 1, w, 1
-            pos_y = torch.linspace(0.5, h - 0.5, h, dtype=torch.float32, device=h.device)[None, None, :, None] * stride  # 1, 1, h, 1
-
-            if self.rpe_type == 'abs_log8':
-                delta_x = ref_pts[..., 0::2] - pos_x  # B, nQ, w, 2
-                delta_y = ref_pts[..., 1::2] - pos_y  # B, nQ, h, 2
-                delta_x = torch.sign(delta_x) * torch.log2(torch.abs(delta_x) + 1.0) / np.log2(8)
-                delta_y = torch.sign(delta_y) * torch.log2(torch.abs(delta_y) + 1.0) / np.log2(8)
-            elif self.rpe_type == 'linear':
-                delta_x = ref_pts[..., 0::2] - pos_x  # B, nQ, w, 2
-                delta_y = ref_pts[..., 1::2] - pos_y  # B, nQ, h, 2
-            else:
-                raise NotImplementedError
-
-            rpe_x, rpe_y = self.cpb_mlp1(delta_x), self.cpb_mlp2(delta_y)  # B, nQ, w/h, nheads
-            rpe = (rpe_x[:, :, None] + rpe_y[:, :, :, None]).flatten(2, 3) # B, nQ, h, w, nheads ->  B, nQ, h*w, nheads
-            rpe = rpe.permute(0, 3, 1, 2)
-
-            k = self.k(k_input_flatten).reshape(B, HW, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-            v = self.v(v_input_flatten).reshape(B, HW, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-            q = self.q(query).reshape(B, Nq, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-            q = q * self.scale
-
-            attn = q @ k.transpose(-2, -1)
-            attn += rpe
-            if input_padding_mask is not None:
-                attn += input_padding_mask[:, None, None] * -100
-
-            fmin, fmax = torch.finfo(attn.dtype).min, torch.finfo(attn.dtype).max
-            torch.clip_(attn, min=fmin, max=fmax)
-
-            attn = self.softmax(attn)
-            attn = self.attn_drop(attn)
-            x = attn @ v
-
-            x = x.transpose(1, 2).reshape(B, Nq, C)
-            x = self.proj(x)
-            x = self.proj_drop(x)
-            return x
+        # PosMLP or PosGaussian mode
+        # Add positional embeddings
+        if query_pos.dim() == 2:
+            queries = raw_query + query_pos[None, :, :]
         else:
-            # PosMLP or PosGaussian mode
-            # Add positional embeddings
-            if query_pos.dim() == 2:
-                queries = raw_query + query_pos[None, :, :]
-            else:
-                queries = raw_query + query_pos
+            queries = raw_query + query_pos
 
-            memory = raw_src.view(B, h, w, C)
-            if src_pos_embed.dim() == 2:
-                src_pos_embed_exp = src_pos_embed[None, :, :].view(B, h, w, C)
-            else:
-                src_pos_embed_exp = src_pos_embed.view(1, h, w, C)
-            memory = memory + src_pos_embed_exp
+        memory = raw_src.view(B, h, w, C)
+        if src_pos_embed.dim() == 2:
+            src_pos_embed_exp = src_pos_embed[None, :, :].view(B, h, w, C)
+        else:
+            src_pos_embed_exp = src_pos_embed.view(1, h, w, C)
+        memory = memory + src_pos_embed_exp
 
-            # Prepare attn_mask
-            if input_padding_mask is not None:
-                # Assume input_padding_mask is (B, HW), bool or float; convert to bool for masked_fill
-                if input_padding_mask.dtype != torch.bool:
-                    input_padding_mask = input_padding_mask > 0.5
-                attn_mask = input_padding_mask[:, None, None, :].expand(B, self.num_heads, Nq, HW)
-            else:
-                attn_mask = None
+        # Prepare attn_mask
+        if input_padding_mask is not None:
+            # Assume input_padding_mask is (B, HW), bool or float; convert to bool for masked_fill
+            if input_padding_mask.dtype != torch.bool:
+                input_padding_mask = input_padding_mask > 0.5
+            attn_mask = input_padding_mask[:, None, None, :].expand(B, self.num_heads, Nq, HW)
+        else:
+            attn_mask = None
 
-            out, _ = self.cross_attn.forward_inner(
-                queries,
-                memory,
-                reference_points,
-                query_pos_emb=None,
-                memory_pos_emb=None,
-                attn_mask=attn_mask,
-                return_attn_logits=False
-            )
-            return out
+        out, _ = self.cross_attn.forward_inner(
+            queries,
+            memory,
+            reference_points,
+            query_pos_emb=None,
+            memory_pos_emb=None,
+            attn_mask=attn_mask,
+            return_attn_logits=False
+        )
+        return out
 
 
 class GlobalDecoderLayer(nn.Module):
@@ -454,7 +376,7 @@ def build_global_rpb_decoder(args):
         n_heads=args.nheads,
         norm_type=args.norm_type,
         rpe_hidden_dim=args.rpe_hidden_dim,
-        rpe_type=args.rpe_type,
+        rpe_type=args.decoder_rpe_type,
         feature_stride=args.feature_stride,
         reparam=args.reparam,
     )
