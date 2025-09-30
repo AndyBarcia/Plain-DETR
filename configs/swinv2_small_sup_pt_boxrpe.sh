@@ -3,7 +3,7 @@
 set -x
 
 FILE_NAME=$(basename $0)
-EXP_DIR=./exps/${FILE_NAME%.*}
+EXP_DIR=.outputs/${FILE_NAME%.*}
 PY_ARGS=${@:1}
 
 python -u main.py \

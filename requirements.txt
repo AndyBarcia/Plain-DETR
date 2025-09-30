@@ -1,4 +1,4 @@
-mmpycocotools
+#mmpycocotools
 tqdm
 cython
 scipy
