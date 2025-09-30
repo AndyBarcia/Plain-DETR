@@ -28,10 +28,9 @@ import datasets
 import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch
+from engine import evaluate, train_one_epoch, setup_logging
 from models import build_model
 from torch import distributed as dist
-import wandb
 
 
 def get_args_parser():
@@ -276,6 +275,7 @@ def get_args_parser():
 
     # * logging technologies
     parser.add_argument("--use_wandb", action="store_true", default=False)
+    parser.add_argument("--use_tensorboard", action="store_true", default=True)
     parser.add_argument("--wandb_entity", type=str)
     parser.add_argument("--wandb_name", type=str)
 
@@ -284,11 +284,18 @@ def get_args_parser():
 
 def main(args):
     utils.init_distributed_mode(args)
-    print("git:\n  {}\n".format(utils.get_sha()))
+
+    # Setup logging
+    output_dir = Path(args.output_dir)
+    if args.output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    logger, tb_writer = setup_logging(args.output_dir, args.use_tensorboard, args.use_wandb, args)
+
+    logger.info("git:\n  {}\n".format(utils.get_sha()))
 
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
-    print(args)
+    logger.info(args)
 
     device = torch.device(args.device)
 
@@ -303,11 +310,9 @@ def main(args):
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    # print(model_without_ddp)
-    print("number of params:", n_parameters)
+    logger.info(f"number of params: {n_parameters}")
 
-    if args.use_fp16:
-        scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler() if args.use_fp16 else None
 
     dataset_train = build_dataset(image_set="train", args=args)
     dataset_val = build_dataset(image_set="val", args=args)
@@ -344,7 +349,6 @@ def main(args):
         pin_memory=True,
     )
 
-    # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
     param_dicts = utils.get_param_dict(model_without_ddp, args, use_layerwise_decay=args.use_layerwise_decay)
     if args.sgd:
         optimizer = torch.optim.SGD(
@@ -355,16 +359,6 @@ def main(args):
             param_dicts, lr=args.lr, weight_decay=args.weight_decay
         )
 
-    # TODO: is there any more elegant way to print the param groups?
-    name_dicts = utils.get_param_dict(model_without_ddp, args, return_name=True, use_layerwise_decay=args.use_layerwise_decay)
-    if args.use_layerwise_decay:
-        for i, name_dict in enumerate(name_dicts):
-            print(f"Group-{i} {json.dumps(name_dict, indent=2)}")
-    else:
-        for i, name_dict in enumerate(name_dicts):
-            print(f"Group-{i} lr: {name_dict['lr']} wd: {name_dict['weight_decay']}")
-            print(json.dumps(name_dict["params"], indent=2))
-    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
     epoch_iter = len(data_loader_train)
     if args.warmup:
         lambda0 = lambda cur_iter: cur_iter / args.warmup if cur_iter < args.warmup else (0.1 if cur_iter > args.lr_drop * epoch_iter else 1)
@@ -373,11 +367,10 @@ def main(args):
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda0)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
     if args.dataset_file == "coco_panoptic":
-        # We also evaluate AP during panoptic training, on original coco DS
         coco_val = datasets.coco.build("val", args)
         base_ds = get_coco_api_from_dataset(coco_val)
     else:
@@ -387,23 +380,16 @@ def main(args):
         checkpoint = torch.load(args.frozen_weights, map_location="cpu")
         model_without_ddp.detr.load_state_dict(checkpoint["model"])
 
-    if args.use_wandb and dist.get_rank() == 0:
-        wandb.init(
-            entity=args.wandb_entity,
-            project='Plain-DETR',
-            id=args.wandb_name,  # set id as wandb_name for resume
-            name=args.wandb_name,
-        )
-
-    output_dir = Path(args.output_dir)
     if args.auto_resume:
         resume_from = utils.find_latest_checkpoint(output_dir)
         if resume_from is not None:
-            print(f'Use autoresume, overwrite args.resume with {resume_from}')
+            logger.info(f'Use autoresume, overwrite args.resume with {resume_from}')
             args.resume = resume_from
         else:
-            print(f'Use autoresume, but can not find checkpoint in {output_dir}')
+            logger.info(f'Use autoresume, but can not find checkpoint in {output_dir}')
+
     if args.resume and os.path.exists(args.resume):
+        logger.info(f"Resuming from checkpoint: {args.resume}")
         if args.resume.startswith("https"):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location="cpu", check_hash=True
@@ -414,17 +400,12 @@ def main(args):
             checkpoint["model"], strict=False
         )
         if len(missing_keys) > 0:
-            print("Missing Keys: {}".format(missing_keys))
+            logger.info(f"Missing Keys: {missing_keys}")
         if len(unexpected_keys) > 0:
-            print("Unexpected Keys: {}".format(unexpected_keys))
-        if (
-            not args.eval
-            and "optimizer" in checkpoint
-            and "lr_scheduler" in checkpoint
-            and "epoch" in checkpoint
-        ):
-            import copy
+            logger.info(f"Unexpected Keys: {unexpected_keys}")
 
+        if not args.eval and "optimizer" in checkpoint and "lr_scheduler" in checkpoint and "epoch" in checkpoint:
+            import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
             optimizer.load_state_dict(checkpoint["optimizer"])
             for pg, pg_old in zip(optimizer.param_groups, p_groups):
@@ -432,44 +413,49 @@ def main(args):
                 pg["initial_lr"] = pg_old["initial_lr"]
 
             lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            print(
-                # For LambdaLR, the lambda funcs are not been stored in state_dict, see
-                # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#LambdaLR.state_dict
-                "Warning: lr scheduler has been resumed from checkpoint, but the lambda funcs are not been stored in state_dict. \n"
-                "So the new lr schedule would override the resumed lr schedule."
+            logger.warning(
+                "Warning: lr scheduler has been resumed from checkpoint, but the lambda funcs are not stored in state_dict. "
+                "The new lr schedule will override the resumed one."
             )
             lr_scheduler.step(lr_scheduler.last_epoch)
             args.start_epoch = checkpoint["epoch"] + 1
 
             if args.use_fp16 and "scaler" in checkpoint:
                 scaler.load_state_dict(checkpoint["scaler"])
-        # check the resumed model
+
         if not args.eval:
+            logger.info("Running evaluation after resuming...")
             test_stats, coco_evaluator = evaluate(
-                model,
-                criterion,
-                postprocessors,
-                data_loader_val,
-                base_ds,
-                device,
-                args.output_dir,
+                model=model,
+                criterion=criterion,
+                postprocessors=postprocessors,
+                data_loader=data_loader_val,
+                base_ds=base_ds,
+                device=device,
+                output_dir=args.output_dir,
                 step=args.start_epoch * len(data_loader_train),
                 use_wandb=args.use_wandb,
+                use_tensorboard=args.use_tensorboard,
                 reparam=args.reparam,
+                logger=logger,
+                tb_writer=tb_writer,
             )
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(
-            model,
-            criterion,
-            postprocessors,
-            data_loader_val,
-            base_ds,
-            device,
-            args.output_dir,
+            model=model,
+            criterion=criterion,
+            postprocessors=postprocessors,
+            data_loader=data_loader_val,
+            base_ds=base_ds,
+            device=device,
+            output_dir=args.output_dir,
             step=args.start_epoch * len(data_loader_train),
             use_wandb=args.use_wandb,
+            use_tensorboard=args.use_tensorboard,
             reparam=args.reparam,
+            logger=logger,
+            tb_writer=tb_writer,
         )
         if args.output_dir:
             utils.save_on_master(
@@ -482,32 +468,34 @@ def main(args):
                 msg += f"AP{label} "
             for ap in coco_evaluator.coco_eval["bbox"].stats[:len(areaRngLbl)]:
                 msg += "{:.3f} ".format(ap)
-            print(msg)
+            logger.info(msg)
         return
 
-    print("Start training")
+    logger.info("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
-            model,
-            criterion,
-            data_loader_train,
-            optimizer,
-            device,
-            epoch,
-            lr_scheduler,
-            args.clip_max_norm,
+            model=model,
+            criterion=criterion,
+            data_loader=data_loader_train,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            lr_scheduler=lr_scheduler,
+            max_norm=args.clip_max_norm,
             k_one2many=args.k_one2many,
             lambda_one2many=args.lambda_one2many,
             use_wandb=args.use_wandb,
+            use_tensorboard=args.use_tensorboard,
             use_fp16=args.use_fp16,
-            scaler=scaler if args.use_fp16 else None,
+            scaler=scaler,
+            logger=logger,
+            tb_writer=tb_writer,
         )
         if args.output_dir:
             checkpoint_paths = [output_dir / "checkpoint.pth"]
-            # extra checkpoint before LR drop and every 5 epochs
             checkpoint_paths.append(output_dir / f"checkpoint{epoch:04}.pth")
             for checkpoint_path in checkpoint_paths:
                 save_dict = {
@@ -519,22 +507,22 @@ def main(args):
                 }
                 if args.use_fp16:
                     save_dict["scaler"] = scaler.state_dict()
-                utils.save_on_master(
-                    save_dict,
-                    checkpoint_path,
-                )
+                utils.save_on_master(save_dict, checkpoint_path)
 
         test_stats, coco_evaluator = evaluate(
-            model,
-            criterion,
-            postprocessors,
-            data_loader_val,
-            base_ds,
-            device,
-            args.output_dir,
+            model=model,
+            criterion=criterion,
+            postprocessors=postprocessors,
+            data_loader=data_loader_val,
+            base_ds=base_ds,
+            device=device,
+            output_dir=args.output_dir,
             step=(epoch + 1) * len(data_loader_train),
             use_wandb=args.use_wandb,
+            use_tensorboard=args.use_tensorboard,
             reparam=args.reparam,
+            logger=logger,
+            tb_writer=tb_writer,
         )
 
         log_stats = {
@@ -548,7 +536,6 @@ def main(args):
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-            # for evaluation logs
             if coco_evaluator is not None:
                 (output_dir / "eval").mkdir(exist_ok=True)
                 if "bbox" in coco_evaluator.coco_eval:
@@ -560,18 +547,17 @@ def main(args):
                             coco_evaluator.coco_eval["bbox"].eval,
                             output_dir / "eval" / name,
                         )
-
                 areaRngLbl = ['', '50', '75', 's', 'm', 'l']
                 msg = "copypaste: "
                 for label in areaRngLbl:
                     msg += f"AP{label} "
                 for ap in coco_evaluator.coco_eval["bbox"].stats[:len(areaRngLbl)]:
                     msg += "{:.3f} ".format(ap)
-                print(msg)
+                logger.info(msg)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print("Training time {}".format(total_time_str))
+    logger.info(f"Training time {total_time_str}")
 
 
 if __name__ == "__main__":

@@ -17,16 +17,65 @@ Train and eval functions used in main.py
 import math
 import os
 import sys
+import time
+import datetime
+import logging
+from collections import defaultdict
 from typing import Iterable
 import copy
 
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 import torch
+import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
+
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
 from datasets.data_prefetcher import data_prefetcher
-from torch import distributed as dist
+
+
+def setup_logging(output_dir, use_tensorboard=False, use_wandb=False, args=None):
+    """
+    Sets up logging to file, standard output, and optionally TensorBoard and W&B.
+    """
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    # Avoid adding handlers multiple times
+    if not logger.handlers:
+        # Create file handler
+        log_file = os.path.join(output_dir, 'run.log')
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+
+        # Create console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(logging.INFO)
+
+        # Create formatter and add it to the handlers
+        formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+
+        # Add the handlers to the logger
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+
+    # Initialize TensorBoard writer
+    tb_writer = None
+    if use_tensorboard and utils.get_rank() == 0:
+        tb_writer = SummaryWriter(output_dir)
+
+    # Initialize W&B
+    if use_wandb and utils.get_rank() == 0:
+        wandb.init(project="plain-detr", config=args, name=args.wandb_name, entity=args.wandb_entity)
+
+    return logger, tb_writer
 
 
 def train_hybrid(outputs, targets, k_one2many, criterion, lambda_one2many):
@@ -68,8 +117,11 @@ def train_one_epoch(
     k_one2many: int = 1,
     lambda_one2many: float = 1.0,
     use_wandb: bool = False,
+    use_tensorboard: bool = False,
     use_fp16: bool = False,
     scaler: torch.cuda.amp.GradScaler = None,
+    logger: logging.Logger = None,
+    tb_writer: SummaryWriter = None,
 ):
     model.train()
     criterion.train()
@@ -87,8 +139,7 @@ def train_one_epoch(
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
 
-    # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-    for idx in metric_logger.log_every(range(len(data_loader)), print_freq, header):
+    for idx in metric_logger.log_every(range(len(data_loader)), print_freq, header, logger=logger):
         optimizer.zero_grad()
 
         with torch.cuda.amp.autocast(enabled=use_fp16):
@@ -105,7 +156,6 @@ def train_one_epoch(
             loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict
         )
 
-        # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
         loss_dict_reduced_scaled = {
             k: v * weight_dict[k]
@@ -113,34 +163,32 @@ def train_one_epoch(
             if k in weight_dict
         }
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
-
         loss_value = losses_reduced_scaled.item()
 
         if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            print(loss_dict_reduced)
+            error_msg = f"Loss is {loss_value}, stopping training"
+            if logger:
+                logger.error(error_msg)
+                logger.error(loss_dict_reduced)
+            else:
+                print(error_msg)
+                print(loss_dict_reduced)
             sys.exit(1)
 
         if use_fp16:
             scaler.scale(losses).backward()
             scaler.unscale_(optimizer)
-            if max_norm > 0:
-                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            else:
-                grad_total_norm = utils.get_total_grad_norm(model.parameters(), norm_type=2)
+            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm) if max_norm > 0 \
+                else utils.get_total_grad_norm(model.parameters(), norm_type=2)
             scaler.step(optimizer)
             scaler.update()
         else:
             losses.backward()
-            if max_norm > 0:
-                grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-            else:
-                grad_total_norm = utils.get_total_grad_norm(model.parameters(), norm_type=2)
+            grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm) if max_norm > 0 \
+                else utils.get_total_grad_norm(model.parameters(), norm_type=2)
             optimizer.step()
 
-        metric_logger.update(
-            loss=loss_value, **loss_dict_reduced_scaled,
-        )
+        metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled)
         metric_logger.update(class_error=loss_dict_reduced["class_error"])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
@@ -148,19 +196,41 @@ def train_one_epoch(
         samples, targets = prefetcher.next()
         lr_scheduler.step()
 
-        if use_wandb and idx % print_freq == 0 and dist.get_rank() == 0:
-            log_data = dict(
-                loss=loss_value,
-                lr=optimizer.param_groups[0]["lr"],
-                grad_norm=grad_total_norm,
+        if (idx + 1) % print_freq == 0 and utils.get_rank() == 0:
+            log_data = {
+                "loss": loss_value,
+                "lr": optimizer.param_groups[0]["lr"],
+                "grad_norm": grad_total_norm,
                 **loss_dict_reduced_scaled
-            )
-            log_data = {"train/"+k: v for k, v in log_data.items()}
-            wandb.log(data=log_data, step=(epoch * len(data_loader) + idx))
-    # gather the stats from all processes
+            }
+            global_step = epoch * len(data_loader) + idx
+
+            if use_tensorboard and tb_writer:
+                for k, v in log_data.items():
+                    tb_writer.add_scalar(f"train/{k}", v, global_step)
+
+            if use_wandb:
+                wandb_log_data = {"train/" + k: v for k, v in log_data.items()}
+                wandb.log(data=wandb_log_data, step=global_step)
+
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    log_message = f"Averaged stats for epoch {epoch}: {metric_logger}"
+    if logger:
+        logger.info(log_message)
+    else:
+        print(log_message)
+        
+    epoch_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    
+    if utils.get_rank() == 0:
+        if use_tensorboard and tb_writer:
+            for k, v in epoch_stats.items():
+                tb_writer.add_scalar(f"train_epoch/{k}", v, epoch)
+        if use_wandb:
+            wandb_epoch_stats = {"train_epoch/" + k: v for k, v in epoch_stats.items()}
+            wandb.log(data=wandb_epoch_stats, step=epoch)
+            
+    return epoch_stats
 
 
 @torch.no_grad()
@@ -174,10 +244,11 @@ def evaluate(
     output_dir,
     step,
     use_wandb=False,
+    use_tensorboard=False,
     reparam=False,
+    logger: logging.Logger = None,
+    tb_writer: SummaryWriter = None,
 ):
-    # (hack) disable the one-to-many branch queries
-    # save them frist
     save_num_queries = model.module.num_queries
     save_two_stage_num_proposals = model.module.transformer.two_stage_num_proposals
     model.module.num_queries = model.module.num_queries_one2one
@@ -194,7 +265,6 @@ def evaluate(
 
     iou_types = tuple(k for k in ("segm", "bbox") if k in postprocessors.keys())
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
-    # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
     panoptic_evaluator = None
     if "panoptic" in postprocessors.keys():
@@ -204,7 +274,7 @@ def evaluate(
             output_dir=os.path.join(output_dir, "panoptic_eval"),
         )
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for samples, targets in metric_logger.log_every(data_loader, 10, header, logger=logger):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
@@ -212,7 +282,6 @@ def evaluate(
         loss_dict = criterion(outputs, targets)
         weight_dict = criterion.weight_dict
 
-        # reduce losses over all GPUs for logging purposes
         loss_dict_reduced = utils.reduce_dict(loss_dict)
         loss_dict_reduced_scaled = {
             k: v * weight_dict[k]
@@ -227,74 +296,70 @@ def evaluate(
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         target_sizes = torch.stack([t["size"] for t in targets], dim=0)
-        if reparam:
-            results = postprocessors["bbox"](outputs, target_sizes, orig_target_sizes)
-        else:
-            results = postprocessors["bbox"](outputs, orig_target_sizes)
+        results = postprocessors["bbox"](outputs, orig_target_sizes) if not reparam else postprocessors["bbox"](outputs, target_sizes, orig_target_sizes)
+        
         if "segm" in postprocessors.keys():
-            target_sizes = torch.stack([t["size"] for t in targets], dim=0)
-            results = postprocessors["segm"](
-                results, outputs, orig_target_sizes, target_sizes
-            )
-        res = {
-            target["image_id"].item(): output
-            for target, output in zip(targets, results)
-        }
-        if coco_evaluator is not None:
+            results = postprocessors["segm"](results, outputs, orig_target_sizes, target_sizes)
+        
+        res = {target["image_id"].item(): output for target, output in zip(targets, results)}
+        
+        if coco_evaluator:
             coco_evaluator.update(res)
 
-        if panoptic_evaluator is not None:
-            res_pano = postprocessors["panoptic"](
-                outputs, target_sizes, orig_target_sizes
-            )
+        if panoptic_evaluator:
+            res_pano = postprocessors["panoptic"](outputs, target_sizes, orig_target_sizes)
             for i, target in enumerate(targets):
                 image_id = target["image_id"].item()
-                file_name = f"{image_id:012d}.png"
-                res_pano[i]["image_id"] = image_id
-                res_pano[i]["file_name"] = file_name
-
+                res_pano[i].update({"image_id": image_id, "file_name": f"{image_id:012d}.png"})
             panoptic_evaluator.update(res_pano)
 
-    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    if coco_evaluator is not None:
+    log_message = f"Averaged stats for evaluation at step {step}: {metric_logger}"
+    if logger:
+        logger.info(log_message)
+    else:
+        print(log_message)
+
+    if coco_evaluator:
         coco_evaluator.synchronize_between_processes()
-    if panoptic_evaluator is not None:
+    if panoptic_evaluator:
         panoptic_evaluator.synchronize_between_processes()
 
-    # accumulate predictions from all images
-    if coco_evaluator is not None:
+    if coco_evaluator:
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
-    panoptic_res = None
-    if panoptic_evaluator is not None:
-        panoptic_res = panoptic_evaluator.summarize()
+        
+    panoptic_res = panoptic_evaluator.summarize() if panoptic_evaluator else None
+        
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    if coco_evaluator is not None:
+    if coco_evaluator:
         if "bbox" in postprocessors.keys():
             stats["coco_eval_bbox"] = coco_evaluator.coco_eval["bbox"].stats.tolist()
         if "segm" in postprocessors.keys():
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
-    if panoptic_res is not None:
-        stats["PQ_all"] = panoptic_res["All"]
-        stats["PQ_th"] = panoptic_res["Things"]
-        stats["PQ_st"] = panoptic_res["Stuff"]
-    if use_wandb and utils.get_rank() == 0:
-        log_data = {
-            "bbox/AP": stats["coco_eval_bbox"][0],
-            "bbox/AP50": stats["coco_eval_bbox"][1],
-            "bbox/AP75": stats["coco_eval_bbox"][2],
-            "bbox/APs": stats["coco_eval_bbox"][3],
-            "bbox/APm": stats["coco_eval_bbox"][4],
-            "bbox/APl": stats["coco_eval_bbox"][5],
-        }
+            
+    if panoptic_res:
+        stats.update(panoptic_res)
+        
+    if utils.get_rank() == 0:
+        log_data = {}
+        if "coco_eval_bbox" in stats:
+            log_data.update({
+                "val/bbox_AP": stats["coco_eval_bbox"][0], "val/bbox_AP50": stats["coco_eval_bbox"][1],
+                "val/bbox_AP75": stats["coco_eval_bbox"][2], "val/bbox_APs": stats["coco_eval_bbox"][3],
+                "val/bbox_APm": stats["coco_eval_bbox"][4], "val/bbox_APl": stats["coco_eval_bbox"][5],
+            })
         for k, v in stats.items():
             if k not in ["coco_eval_bbox", "coco_eval_masks"]:
-                log_data["val/" + k] = v
-        wandb.log(data=log_data, step=step)
+                log_data[f"val/{k}"] = v.get("pq", v) if isinstance(v, dict) else v
 
-    # recover the model parameters for next training epoch
+        if use_tensorboard and tb_writer:
+            for k, v in log_data.items():
+                tb_writer.add_scalar(k, v, step)
+
+        if use_wandb:
+            wandb.log(data=log_data, step=step)
+
     model.module.num_queries = save_num_queries
     model.module.transformer.two_stage_num_proposals = save_two_stage_num_proposals
     return stats, coco_evaluator

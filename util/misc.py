@@ -177,8 +177,7 @@ class MetricLogger(object):
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
-            if isinstance(v, torch.Tensor):
-                v = v.item()
+            v = v.item() if isinstance(v, torch.Tensor) else v
             assert isinstance(v, (float, int))
             self.meters[k].update(v)
 
@@ -187,15 +186,10 @@ class MetricLogger(object):
             return self.meters[attr]
         if attr in self.__dict__:
             return self.__dict__[attr]
-        raise AttributeError(
-            "'{}' object has no attribute '{}'".format(type(self).__name__, attr)
-        )
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
 
     def __str__(self):
-        loss_str = []
-        for name, meter in self.meters.items():
-            loss_str.append("{}: {}".format(name, str(meter)))
-        return self.delimiter.join(loss_str)
+        return self.delimiter.join(f"{name}: {str(meter)}" for name, meter in self.meters.items())
 
     def synchronize_between_processes(self):
         for meter in self.meters.values():
@@ -204,7 +198,7 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None):
+    def log_every(self, iterable, print_freq, header=None, logger=None):
         i = 0
         if not header:
             header = ""
@@ -213,29 +207,19 @@ class MetricLogger(object):
         iter_time = SmoothedValue(fmt="{avg:.4f}")
         data_time = SmoothedValue(fmt="{avg:.4f}")
         space_fmt = ":" + str(len(str(len(iterable)))) + "d"
+        
+        log_msg_components = [
+            header,
+            "[{0" + space_fmt + "}/{1}]",
+            "eta: {eta}",
+            "{meters}",
+            "time: {time}",
+            "data: {data}",
+        ]
         if torch.cuda.is_available():
-            log_msg = self.delimiter.join(
-                [
-                    header,
-                    "[{0" + space_fmt + "}/{1}]",
-                    "eta: {eta}",
-                    "{meters}",
-                    "time: {time}",
-                    "data: {data}",
-                    "max mem: {memory:.0f}",
-                ]
-            )
-        else:
-            log_msg = self.delimiter.join(
-                [
-                    header,
-                    "[{0" + space_fmt + "}/{1}]",
-                    "eta: {eta}",
-                    "{meters}",
-                    "time: {time}",
-                    "data: {data}",
-                ]
-            )
+            log_msg_components.append("max mem: {memory:.0f}")
+        log_msg = self.delimiter.join(log_msg_components)
+        
         MB = 1024.0 * 1024.0
         for obj in iterable:
             data_time.update(time.time() - end)
@@ -244,38 +228,31 @@ class MetricLogger(object):
             if i % print_freq == 0 or i == len(iterable) - 1:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
+                
+                format_args = {
+                    "i": i, "len_iterable": len(iterable), "eta": eta_string,
+                    "meters": str(self), "time": str(iter_time), "data": str(data_time)
+                }
                 if torch.cuda.is_available():
-                    print(
-                        log_msg.format(
-                            i,
-                            len(iterable),
-                            eta=eta_string,
-                            meters=str(self),
-                            time=str(iter_time),
-                            data=str(data_time),
-                            memory=torch.cuda.max_memory_allocated() / MB,
-                        )
-                    )
+                    format_args["memory"] = torch.cuda.max_memory_allocated() / MB
+                
+                log_message = log_msg.format(i, len(iterable), **format_args)
+                
+                if logger:
+                    logger.info(log_message)
                 else:
-                    print(
-                        log_msg.format(
-                            i,
-                            len(iterable),
-                            eta=eta_string,
-                            meters=str(self),
-                            time=str(iter_time),
-                            data=str(data_time),
-                        )
-                    )
+                    print(log_message)
             i += 1
             end = time.time()
+            
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print(
-            "{} Total time: {} ({:.4f} s / it)".format(
-                header, total_time_str, total_time / len(iterable)
-            )
-        )
+        final_log_msg = f"{header} Total time: {total_time_str} ({total_time / len(iterable):.4f} s / it)"
+        
+        if logger:
+            logger.info(final_log_msg)
+        else:
+            print(final_log_msg)
 
 
 def get_sha():
