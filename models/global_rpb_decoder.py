@@ -324,3 +324,148 @@ class GlobalDecoderLayer(nn.Module):
         tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout4(tgt2)
         tgt = self.norm3(tgt)
+
+        return tgt
+
+    def forward(
+        self,
+        tgt,
+        query_pos,
+        reference_points,
+        src,
+        src_pos_embed,
+        src_spatial_shapes,
+        src_padding_mask=None,
+        self_attn_mask=None,
+    ):
+        if self.norm_type == 'pre_norm':
+            tgt = self.forward_pre(tgt, query_pos, reference_points, src, src_pos_embed, src_spatial_shapes, src_padding_mask, self_attn_mask)
+        elif self.norm_type == 'post_norm':
+            tgt = self.forward_post(tgt, query_pos, reference_points, src, src_pos_embed, src_spatial_shapes, src_padding_mask, self_attn_mask)
+        else:
+            raise NotImplementedError
+        return tgt
+
+
+class GlobalDecoder(nn.Module):
+    def __init__(
+        self,
+        decoder_layer,
+        num_layers,
+        return_intermediate=False,
+        look_forward_twice=False,
+        use_checkpoint=False,
+        d_model=256,
+        norm_type="post_norm",
+        reparam=False,
+    ):
+        super().__init__()
+        self.layers = _get_clones(decoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.bbox_embed = None
+        self.class_embed = None
+        self.norm = None
+        self.return_intermediate = return_intermediate
+        self.look_forward_twice = look_forward_twice
+        self.use_checkpoint = use_checkpoint
+        self.d_model = d_model
+        self.norm_type = norm_type
+        self.reparam = reparam
+
+        if self.norm_type == 'pre_norm':
+            self.norm = nn.LayerNorm(d_model)
+
+    def _reset_parameters(self):
+        for layer in self.layers:
+            layer.reset_parameters()
+
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios, src_padding_mask=None):
+        if self.norm_type == 'pre_norm':
+            tgt = self.norm(tgt)
+
+        output = tgt
+        intermediate = []
+        intermediate_reference_points = []
+        for lid, layer in enumerate(self.layers):
+            if self.use_checkpoint:
+                output = checkpoint.checkpoint(
+                    layer,
+                    output,
+                    query_pos,
+                    reference_points,
+                    src,
+                    src_spatial_shapes,
+                    src_padding_mask,
+                    None,
+                )
+            else:
+                output = layer(
+                    output,
+                    query_pos,
+                    reference_points,
+                    src,
+                    src_spatial_shapes,
+                    src_padding_mask,
+                    None,
+                )
+            if self.return_intermediate:
+                intermediate.append(output)
+                intermediate_reference_points.append(reference_points)
+
+            if self.look_forward_twice and lid < self.num_layers - 1:
+                # look forward twice
+                if self.use_checkpoint:
+                    output = checkpoint.checkpoint(
+                        layer,
+                        output,
+                        query_pos,
+                        reference_points,
+                        src,
+                        src_spatial_shapes,
+                        src_padding_mask,
+                        None,
+                    )
+                else:
+                    output = layer(
+                        output,
+                        query_pos,
+                        reference_points,
+                        src,
+                        src_spatial_shapes,
+                        src_padding_mask,
+                        None,
+                    )
+                if self.return_intermediate:
+                    intermediate.append(output)
+                    intermediate_reference_points.append(reference_points)
+
+        if self.return_intermediate:
+            return torch.stack(intermediate), torch.stack(intermediate_reference_points)
+
+        return output.unsqueeze(0), reference_points.unsqueeze(0)
+
+
+def build_global_rpb_decoder(args):
+    layer = GlobalDecoderLayer(
+        d_model=args.hidden_dim,
+        d_ffn=args.dim_feedforward,
+        dropout=args.dropout,
+        activation=args.activation,
+        n_heads=args.nheads,
+        norm_type=args.norm_type,
+        rpe_hidden_dim=args.rpe_hidden_dim,
+        rpe_type=args.rpe_type,
+        feature_stride=args.feature_stride,
+        reparam=args.reparam,
+    )
+    decoder = GlobalDecoder(
+        layer,
+        args.dec_layers,
+        return_intermediate=args.return_intermediate_dec,
+        look_forward_twice=args.look_forward_twice,
+        use_checkpoint=args.use_checkpoint,
+        d_model=args.hidden_dim,
+        norm_type=args.norm_type,
+        reparam=args.reparam,
+    )
+    return decoder
